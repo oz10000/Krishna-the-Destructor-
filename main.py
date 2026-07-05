@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-KRISHNA KILLING SPREE — MAIN.PY (CONTINUO)
-Versión con loop infinito para GitHub Actions (reinicio cada 5h).
+KRISHNA KILLING SPREE — MAIN.PY
+Versión con gestión temporal de posiciones (Break-Even + Timeout).
 """
 
 import os
@@ -22,34 +22,20 @@ from risk import RiskController
 from utils import log_info, log_warning, log_error, log_debug, log_success
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN (importar parámetros)
 # ============================================================
-SYMBOLS = [
-    "BTC-USDT-SWAP",
-    "ETH-USDT-SWAP",
-    "SOL-USDT-SWAP",
-    "ADA-USDT-SWAP",
-    "XRP-USDT-SWAP",
-    "AVAX-USDT-SWAP",
-]
-
-CAPITAL_INICIAL = 100.0
-BASE_LEVERAGE = 7
-MIN_SCORE = 0.45
-TP_MULT = 1.2
-SL_MULT = 1.0
-COOLDOWN_SECONDS = 15 * 60
-
-METRICS_DIR = "metrics"
-LOGS_DIR = "logs"
-SNAPSHOTS_DIR = "snapshots"
+from config import (
+    SYMBOLS, CAPITAL_INICIAL, BASE_LEVERAGE, MIN_SCORE,
+    TP_MULT, SL_MULT, COOLDOWN_SECONDS,
+    METRICS_DIR, LOGS_DIR, SNAPSHOTS_DIR,
+    BREAK_EVEN_MINUTES, MAX_HOLD_MINUTES,
+    BREAK_EVEN_BUFFER, EVALUATION_INTERVAL
+)
 
 # ============================================================
 # TRACE ENGINE (AUDITORÍA)
 # ============================================================
 class TradeTrace:
-    """Sistema de auditoría paso a paso para cada trade."""
-
     STEPS = [
         "SYMBOL_SELECTED",
         "MARKET_DATA_LOADED",
@@ -151,6 +137,13 @@ class KrishnaKillingSpree:
         self.position = None
         self.instrument_info = {}
         self._last_mode = "NORMAL"
+
+        # 🆕 Variables para gestión temporal de posición
+        self.position_open_time = None
+        self.position_side = None
+        self.position_size = None
+        self.position_symbol = None
+        self.position_entry_price = None
 
         self.stats = {
             'symbols_processed': 0,
@@ -524,14 +517,14 @@ class KrishnaKillingSpree:
     # PNL Y MÉTRICAS
     # ============================================================
     def _append_pnl_row(self, equity: float, pnl_total: float, pnl_ejecucion: float,
-                        trades: int, modo: str) -> None:
+                        trades: int, modo: str, reason: str = "") -> None:
         os.makedirs(METRICS_DIR, exist_ok=True)
         filename = f"{METRICS_DIR}/pnl_history.csv"
         file_exists = os.path.exists(filename)
         with open(filename, 'a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(['fecha', 'hora', 'equity', 'pnl_acumulado', 'pnl_ejecucion', 'trades', 'modo_riesgo'])
+                writer.writerow(['fecha', 'hora', 'equity', 'pnl_acumulado', 'pnl_ejecucion', 'trades', 'modo_riesgo', 'motivo'])
             now = datetime.now(timezone.utc)
             writer.writerow([
                 now.strftime('%Y-%m-%d'),
@@ -540,7 +533,8 @@ class KrishnaKillingSpree:
                 round(pnl_total, 2),
                 round(pnl_ejecucion, 2),
                 trades,
-                modo
+                modo,
+                reason
             ])
 
     def _save_metrics(self) -> None:
@@ -626,10 +620,33 @@ class KrishnaKillingSpree:
         log_info("=" * 60)
 
     # ============================================================
-    # 🆕 ACTUALIZACIÓN PNL TRAS CIERRE
+    # 🆕 GESTIÓN TEMPORAL DE POSICIÓN
     # ============================================================
-    def _update_pnl_after_close(self) -> None:
-        """Actualiza PnL cuando una posición se cierra."""
+    def _check_time_exit(self, position_data: Dict, pnl_pct: float, elapsed_minutes: float) -> Tuple[bool, str]:
+        """
+        Evalúa si la posición debe cerrarse por tiempo.
+        Retorna (cerrar, motivo).
+        """
+        # Break-Even Positivo (solo si ha pasado el tiempo mínimo)
+        if elapsed_minutes >= BREAK_EVEN_MINUTES:
+            # Comisiones + slippage estimado (0.04% entrada + 0.04% salida + 0.02% slippage = 0.10%)
+            fees_slippage = 0.0010  # 0.10%
+            total_costs = fees_slippage + (BREAK_EVEN_BUFFER / 100.0)
+            net_pnl = (pnl_pct / 100.0) - total_costs
+            if net_pnl > 0:
+                return True, "BREAK_EVEN"
+
+        # Timeout máximo
+        if elapsed_minutes >= MAX_HOLD_MINUTES:
+            return True, "TIMEOUT"
+
+        return False, ""
+
+    # ============================================================
+    # ACTUALIZACIÓN DE PNL TRAS CIERRE (con motivo)
+    # ============================================================
+    def _update_pnl_after_close(self, reason: str = "UNKNOWN") -> None:
+        """Actualiza PnL cuando una posición se cierra (por TP/SL o tiempo)."""
         bal = self.exchange.get_balance()
         if bal.get('ok'):
             data = bal.get('data', [])
@@ -642,12 +659,13 @@ class KrishnaKillingSpree:
                             self.pnl_total += pnl_ejecucion
                             self.last_equity = equity
                             self.capital = equity
-                            self._append_pnl_row(equity, self.pnl_total, pnl_ejecucion, self.trades_count, self.risk.mode)
-                            log_info(f"📈 PnL del trade: {pnl_ejecucion:.2f} USDT | PnL total: {self.pnl_total:.2f} USDT")
+                            self._append_pnl_row(equity, self.pnl_total, pnl_ejecucion,
+                                                  self.trades_count, self.risk.mode, reason)
+                            log_info(f"📈 PnL del trade ({reason}): {pnl_ejecucion:.2f} USDT | PnL total: {self.pnl_total:.2f} USDT")
                         break
 
     # ============================================================
-    # 🆕 BUCLE INFINITO (PARA GITHUB ACTIONS)
+    # BUCLE INFINITO (PARA GITHUB ACTIONS)
     # ============================================================
     def run(self) -> Dict:
         """Bucle principal INFINITO — para GitHub Actions (reinicio cada 5h)."""
@@ -678,25 +696,70 @@ class KrishnaKillingSpree:
 
                 if active_positions:
                     if not position_open:
-                        log_info(f"📊 Posición activa: {active_positions[0].get('instId')}")
+                        pos = active_positions[0]
+                        log_info(f"📊 Posición activa: {pos.get('instId')}")
                         position_open = True
+                        # Guardar datos de la posición para gestión temporal
+                        self.position_symbol = pos.get('instId')
+                        self.position_side = pos.get('posSide')
+                        self.position_size = abs(float(pos.get('pos')))
+                        self.position_entry_price = safe_float(pos.get('avgPx'))
+                        # cTime viene en milisegundos desde OKX
+                        cTime = pos.get('cTime')
+                        if cTime:
+                            self.position_open_time = int(cTime) / 1000.0
+                        else:
+                            self.position_open_time = time.time()
+                        log_debug(f"Posición abierta a las: {datetime.fromtimestamp(self.position_open_time).isoformat()}")
 
-                    # Mostrar PnL cada 30 segundos
+                    # Mostrar PnL y verificar gestión temporal
                     now = time.time()
-                    if now - last_position_check > 30:
+                    if now - last_position_check > EVALUATION_INTERVAL:
                         for p in active_positions:
                             pnl = safe_float(p.get('upl'))
                             log_info(f"💹 PnL: {pnl:.2f} USDT")
+
+                            # Calcular duración
+                            if self.position_open_time:
+                                elapsed_minutes = (now - self.position_open_time) / 60.0
+                            else:
+                                elapsed_minutes = 0
+
+                            # Evaluar cierre por tiempo
+                            close, reason = self._check_time_exit(p, pnl, elapsed_minutes)
+                            if close:
+                                log_info(f"⏰ Cerrando por {reason} (tiempo: {elapsed_minutes:.1f} min)")
+                                symbol = p.get('instId')
+                                side = p.get('posSide')
+                                size = abs(float(p.get('pos')))
+                                self.exchange.close_position_market(symbol, side, size)
+                                position_open = False
+                                self._update_pnl_after_close(reason)
+                                # Limpiar variables de posición
+                                self.position_open_time = None
+                                self.position_side = None
+                                self.position_size = None
+                                self.position_symbol = None
+                                self.position_entry_price = None
+                                break
+
                         last_position_check = now
 
-                    time.sleep(5)  # Esperar antes de volver a verificar
+                    time.sleep(5)
                     continue
 
                 # 2. No hay posición → buscar señal
                 if position_open:
                     log_info("✅ Posición cerrada. Buscando nueva oportunidad...")
                     position_open = False
-                    self._update_pnl_after_close()
+                    # Asegurar que se actualice PnL si no se hizo antes
+                    if self.position_symbol:
+                        self._update_pnl_after_close("UNKNOWN")
+                        self.position_open_time = None
+                        self.position_side = None
+                        self.position_size = None
+                        self.position_symbol = None
+                        self.position_entry_price = None
 
                 time.sleep(2)
 
