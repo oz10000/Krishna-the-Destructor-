@@ -1,10 +1,6 @@
 # exchange.py
 # ============================================================
-# CLIENTE OKX V5 — CON ATTACHALGOORDS (VERSIÓN COMPLETA)
-# ============================================================
-# Basado en el Position Manager certificado.
-# Compatible con OKX API V5, Demo y Producción.
-# Incluye attachAlgoOrds para TP/SL adjuntos (corregido).
+# CLIENTE OKX V5 — CORREGIDO (POSITION SIDE PARA CIERRE)
 # ============================================================
 
 import hmac
@@ -284,12 +280,19 @@ class Exchange:
     # ============================================================
     # ÓRDENES NORMALES
     # ============================================================
-    def place_market_order(self, symbol: str, side: str, size: float) -> Dict:
-        """Coloca una orden de mercado."""
+    def place_market_order(self, symbol: str, side: str, size: float, pos_side: Optional[str] = None) -> Dict:
+        """
+        Coloca una orden de mercado.
+        pos_side: 'long' o 'short' (opcional, para cerrar posiciones correctamente).
+        """
         if not self._connected:
             return {"ok": False, "error": "No conectado"}
         inst = self._instrument_id(symbol)
-        pos_side = "long" if side.lower() == "buy" else "short"
+
+        # Si no se especifica pos_side, se infiere de side (apertura)
+        if pos_side is None:
+            pos_side = "long" if side.lower() == "buy" else "short"
+
         body = {
             "instId": inst,
             "tdMode": "cross",
@@ -300,12 +303,15 @@ class Exchange:
         }
         return self._request("POST", "/api/v5/trade/order", body=body)
 
-    def place_limit_order(self, symbol: str, side: str, price: float, size: float) -> Dict:
+    def place_limit_order(self, symbol: str, side: str, price: float, size: float, pos_side: Optional[str] = None) -> Dict:
         """Coloca una orden límite."""
         if not self._connected:
             return {"ok": False, "error": "No conectado"}
         inst = self._instrument_id(symbol)
-        pos_side = "long" if side.lower() == "buy" else "short"
+
+        if pos_side is None:
+            pos_side = "long" if side.lower() == "buy" else "short"
+
         body = {
             "instId": inst,
             "tdMode": "cross",
@@ -318,20 +324,20 @@ class Exchange:
         return self._request("POST", "/api/v5/trade/order", body=body)
 
     # ============================================================
-    # 🔥 ÓRDENES CON TP/SL ADJUNTOS (ATTACHALGOORDS)
+    # ÓRDENES CON TP/SL ADJUNTOS (ATTACHALGOORDS)
     # ============================================================
     def place_market_order_with_tp_sl(self, symbol: str, side: str, size: float,
-                                      tp_price: float, sl_price: float) -> Dict:
+                                      tp_price: float, sl_price: float, pos_side: Optional[str] = None) -> Dict:
         """
         Coloca una orden de mercado con TP/SL adjuntos usando attachAlgoOrds.
-        🔥 Esta es la versión CORREGIDA que OKX acepta.
         """
         if not self._connected:
             return {"ok": False, "error": "No conectado"}
         inst = self._instrument_id(symbol)
-        pos_side = "long" if side.lower() == "buy" else "short"
 
-        # Construir attachAlgoOrds (TP y SL adjuntos)
+        if pos_side is None:
+            pos_side = "long" if side.lower() == "buy" else "short"
+
         attach_algo_ords = []
         if tp_price and tp_price > 0:
             attach_algo_ords.append({
@@ -357,42 +363,6 @@ class Exchange:
         }
         return self._request("POST", "/api/v5/trade/order", body=body)
 
-    def place_limit_order_with_tp_sl(self, symbol: str, side: str, price: float, size: float,
-                                     tp_price: float, sl_price: float) -> Dict:
-        """
-        Coloca una orden límite con TP/SL adjuntos usando attachAlgoOrds.
-        """
-        if not self._connected:
-            return {"ok": False, "error": "No conectado"}
-        inst = self._instrument_id(symbol)
-        pos_side = "long" if side.lower() == "buy" else "short"
-
-        attach_algo_ords = []
-        if tp_price and tp_price > 0:
-            attach_algo_ords.append({
-                "tpTriggerPx": str(tp_price),
-                "tpOrdPx": str(price),
-                "tpTriggerPxType": "last"
-            })
-        if sl_price and sl_price > 0:
-            attach_algo_ords.append({
-                "slTriggerPx": str(sl_price),
-                "slOrdPx": str(price),
-                "slTriggerPxType": "last"
-            })
-
-        body = {
-            "instId": inst,
-            "tdMode": "cross",
-            "side": side.lower(),
-            "posSide": pos_side,
-            "ordType": "limit",
-            "px": str(price),
-            "sz": str(size),
-            "attachAlgoOrds": attach_algo_ords
-        }
-        return self._request("POST", "/api/v5/trade/order", body=body)
-
     # ============================================================
     # ÓRDENES ALGORÍTMICAS (POST /api/v5/trade/order-algo)
     # ============================================================
@@ -403,6 +373,7 @@ class Exchange:
         if not self._connected:
             return {"ok": False, "error": "No conectado"}
         inst = self._instrument_id(symbol)
+
         if pos_side is None:
             pos_side = "long" if side.lower() == "sell" else "short"
 
@@ -457,6 +428,7 @@ class Exchange:
         if not self._connected:
             return {"ok": False, "error": "No conectado"}
         inst = self._instrument_id(symbol)
+
         if pos_side is None:
             pos_side = "long" if side.lower() == "sell" else "short"
 
@@ -514,9 +486,14 @@ class Exchange:
         return count
 
     def close_position_market(self, symbol: str, side: str, size: float) -> Dict:
-        """Cierra una posición con orden de mercado."""
+        """
+        Cierra una posición con orden de mercado.
+        side debe ser 'long' o 'short' (el lado de la posición a cerrar).
+        🔥 CORREGIDO: posSide se establece como el lado de la posición.
+        """
         close_side = "sell" if side == "long" else "buy"
-        return self.place_market_order(symbol, close_side, size)
+        # IMPORTANTE: posSide debe ser el lado de la posición que se cierra
+        return self.place_market_order(symbol, close_side, size, pos_side=side)
 
     def close_all_positions(self) -> int:
         """Cierra todas las posiciones abiertas."""
